@@ -2,6 +2,7 @@
 
 // ============================================================================
 // Precision Boost Converter Controller (Arduino UNO / ATmega328P)
+// Tuned for accurate 100V regulation including low-input (Vin < 9V) operation
 // - PWM: Timer1 register PWM on D9 (OC1A) at ~31.25kHz
 // - Feedback: A0 divider, R2=100k (top), R3=4.7k (bottom)
 // - LCD: RS=7, E=6, D4=5, D5=4, D6=3, D7=2
@@ -28,7 +29,7 @@ static const float VOUT_OFFSET_CAL = 0.00f;
 
 static const float ADC_MAX = 1023.0f;
 static const float VOUT_TARGET = 100.0f;
-static const float VIN_NOMINAL = 9.0f;
+static const float VIN_NOMINAL = 8.0f; // conservative feed-forward for Vin <= 9V operation
 
 // ---------------------- Timer1 PWM ----------------------
 // Fast PWM mode 14 (TOP=ICR1), prescaler=1 => 16MHz / (1+511) = 31.25kHz
@@ -53,10 +54,10 @@ uint8_t readyToRegCount = 0;
 uint8_t backToStartCount = 0;
 
 // PI-D with back-calculation anti-windup (more accurate near limit/saturation)
-static float Kp = 0.030f;
-static float Ki = 0.45f;
-static float Kd = 0.00022f;
-static float Kaw = 1.50f; // anti-windup feedback gain
+static float Kp = 0.034f;
+static float Ki = 0.62f;
+static float Kd = 0.00018f;
+static float Kaw = 1.90f; // stronger anti-windup tracking
 
 float iTerm = 0.0f;
 float prevErr = 0.0f;
@@ -96,6 +97,16 @@ static inline void setDuty(float duty) {
   duty = clampf(duty, DUTY_MIN, DUTY_MAX);
   OCR1A = (uint16_t)(duty * PWM_TOP + 0.5f);
   dutyCmd = dutyFromOcr(); // actual applied duty
+}
+
+
+static inline float computeAdaptiveDutyFF(float vout) {
+  // Adaptive feed-forward: derive effective Vin estimate from present operating point
+  // Vin_est ~= Vout*(1-D). Blend with conservative nominal Vin to support Vin<9V cases.
+  float vinEstFromState = clampf(vout * (1.0f - dutyCmd), 3.0f, 15.0f);
+  float vinBlend = 0.65f * VIN_NOMINAL + 0.35f * vinEstFromState;
+  float dutyFF = 1.0f - (vinBlend / VOUT_TARGET);
+  return clampf(dutyFF, 0.70f, DUTY_MAX);
 }
 
 float readVoutInstant() {
@@ -186,7 +197,7 @@ void controlStep(float dt) {
       if (++readyToRegCount >= MODE_CONFIRM_COUNT) {
         mode = REGULATE;
 
-        float dutyFF = 1.0f - (VIN_NOMINAL / VOUT_TARGET);
+        float dutyFF = computeAdaptiveDutyFF(voutFilt);
         float err = VOUT_TARGET - voutFilt;
 
         iTerm = clampf(dutyCmd - dutyFF - Kp * err, -0.20f, 0.20f);
@@ -204,7 +215,7 @@ void controlStep(float dt) {
 
     dErrFilt += 0.10f * (dErr - dErrFilt);
 
-    float dutyFF = 1.0f - (VIN_NOMINAL / VOUT_TARGET); // 0.91 nominal
+    float dutyFF = computeAdaptiveDutyFF(voutFilt);
     float pTerm = Kp * err;
     float dTerm = Kd * dErrFilt;
 
@@ -215,26 +226,24 @@ void controlStep(float dt) {
     // iDot = Ki*e + Kaw*(uSat - uUnsat)
     float iDot = Ki * err + Kaw * (uSat - uUnsat);
 
-    // Freeze integration when far below target to avoid forcing permanent 95% display.
-    if (err > 14.0f) {
-      iDot = Kaw * (uSat - uUnsat);
-    }
-
-    iTerm += iDot * dt;
+    // Scale integrator with error magnitude to keep fast correction at low Vin
+    // while preserving precision near setpoint.
+    float iScale = (err > 20.0f) ? 0.65f : ((err > 8.0f) ? 0.85f : 1.0f);
+    iTerm += (iDot * iScale) * dt;
     iTerm = clampf(iTerm, -0.30f, 0.30f);
 
     float u = clampf(dutyFF + pTerm + iTerm + dTerm, DUTY_MIN, DUTY_MAX);
 
-    // Low-Vin assist for reaching 100V without sticking forever at 95%:
-    // only active when significantly below target.
-    if (voutFilt < 86.0f && u < 0.93f) {
-      u = 0.93f;
+    // Low-Vin assist: dynamic minimum duty so Vin<9V can still converge to 100V.
+    if (voutFilt < 92.0f) {
+      float assist = (voutFilt < 70.0f) ? 0.95f : ((voutFilt < 82.0f) ? 0.94f : 0.92f);
+      if (u < assist) u = assist;
     }
 
     // Overshoot guard with soft recovery (accuracy near 100V)
     if (voutFilt > 103.5f) {
-      u = 0.10f;
-      iTerm = clampf(iTerm, -0.10f, 0.10f);
+      u = 0.14f;
+      iTerm = clampf(iTerm, -0.08f, 0.08f);
     }
 
     setDuty(u);
