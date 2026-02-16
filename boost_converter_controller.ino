@@ -37,7 +37,7 @@ static const float DUTY_MAX = 0.95f; // Critical for 9V -> 100V
 
 // ---------------------- Control loop ----------------------
 // Keep control fast for quicker response.
-static const uint32_t CONTROL_PERIOD_US = 400; // 2.5kHz
+static const uint32_t CONTROL_PERIOD_US = 333; // ~3kHz for faster response
 
 // Startup assist + regulation for reliability.
 enum ControlMode : uint8_t { STARTUP, REGULATE };
@@ -45,19 +45,19 @@ ControlMode mode = STARTUP;
 
 static const float STARTUP_DUTY_BEGIN = 0.88f;
 static const float STARTUP_DUTY_END   = 0.95f;
-static const float STARTUP_RAMP_PER_S = 3.00f;
-static const float STARTUP_EXIT_V = 75.0f;
+static const float STARTUP_RAMP_PER_S = 3.60f;
+static const float STARTUP_EXIT_V = 72.0f;
 static const float STARTUP_REENTER_V = 58.0f;
 
 // Require persistence before mode change (noise immunity).
-static const uint8_t MODE_CONFIRM_COUNT = 8;
+static const uint8_t MODE_CONFIRM_COUNT = 6;
 uint8_t readyToRegCount = 0;
 uint8_t backToStartCount = 0;
 
 // PI-D (with derivative filtering) + feed-forward.
-static float Kp = 0.050f;
-static float Ki = 2.300f;
-static float Kd = 0.00045f;
+static float Kp = 0.058f;
+static float Ki = 2.800f;
+static float Kd = 0.00040f;
 
 float iTerm = 0.0f;
 float prevErr = 0.0f;
@@ -68,9 +68,9 @@ float voutFilt = 0.0f;
 uint32_t lastControlUs = 0;
 
 // ---------------------- LCD timing ----------------------
-// User request: duty-cycle LCD read/update every 500ms.
+// User request: duty-cycle LCD read/update every 100ms.
 static const uint32_t LCD_VOLT_MS = 120;
-static const uint32_t LCD_DUTY_MS = 500;
+static const uint32_t LCD_DUTY_MS = 100;
 uint32_t lastLcdVoltMs = 0;
 uint32_t lastLcdDutyMs = 0;
 
@@ -98,7 +98,7 @@ static inline void setDuty(float duty) {
 }
 
 float readVoutInstant() {
-  // 2-sample average: less noise but still fast for a 2.5kHz loop.
+  // 2-sample average: less noise but still fast for a ~3kHz loop.
   uint16_t a = analogRead(FB_PIN);
   uint16_t b = analogRead(FB_PIN);
   float raw = 0.5f * (a + b);
@@ -159,8 +159,8 @@ void setup() {
 void controlStep(float dt) {
   float vout = readVoutInstant();
 
-  // Slightly faster control filtering for improved response.
-  voutFilt += 0.22f * (vout - voutFilt);
+  // Faster filter for quicker transient response without excessive ripple sensitivity.
+  voutFilt += 0.28f * (vout - voutFilt);
 
   if (mode == STARTUP) {
     dutyCmd += STARTUP_RAMP_PER_S * dt;
@@ -186,7 +186,7 @@ void controlStep(float dt) {
     prevErr = err;
 
     // Derivative low-pass for reliability/noise immunity.
-    dErrFilt += 0.20f * (dErr - dErrFilt);
+    dErrFilt += 0.15f * (dErr - dErrFilt);
 
     // Feed-forward from ideal boost relation D = 1 - Vin/Vout
     float dutyFF = 1.0f - (VIN_NOMINAL / VOUT_TARGET); // ~0.91
@@ -206,8 +206,14 @@ void controlStep(float dt) {
 
     float u = clampf(dutyFF + pTerm + iTerm + dTerm, DUTY_MIN, DUTY_MAX);
 
+    // Reliability guard: if overshoot is significant, force lower duty briefly.
+    if (voutFilt > 108.0f) {
+      u = DUTY_MIN;
+      iTerm = clampf(iTerm, -0.10f, 0.60f);
+    }
+
     // Aggressive assist when still far from target.
-    if (err > 25.0f && u < 0.92f) u = 0.92f;
+    if (err > 25.0f && u < 0.93f) u = 0.93f;
 
     setDuty(u);
 
@@ -256,7 +262,7 @@ void updateLcdDutyLine() {
   float vAvg, dAvg;
   computeDisplayAverages(vAvg, dAvg);
 
-  // Duty line updated every 500ms per request.
+  // Duty line updated every 100ms per request.
   dDisplay = dAvg;
 
   lcd.setCursor(0, 1);
