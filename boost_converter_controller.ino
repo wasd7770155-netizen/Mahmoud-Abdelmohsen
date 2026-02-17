@@ -1,139 +1,109 @@
 #include <LiquidCrystal.h>
+#include <math.h>
 
 // ============================================================================
-// Precision Boost Converter Controller (Arduino UNO / ATmega328P)
-// Tuned for accurate 100V regulation including low-input (Vin < 9V) operation
-// - PWM: Timer1 register PWM on D9 (OC1A) at ~31.25kHz
-// - Feedback: A0 divider, R2=100k (top), R3=4.7k (bottom)
-// - LCD: RS=7, E=6, D4=5, D5=4, D6=3, D7=2
+// High-Gain Boost Converter Controller (Proteus + Arduino UNO)
+// - PWM on D9 (OC1A) using Timer1 register control (NO analogWrite)
+// - Fast PWM Mode 14, TOP=ICR1=511 => ~31.25kHz, 9-bit resolution
+// - Target: 9V -> 100V with robust anti-windup and simulation deadband lock
 // ============================================================================
 
-// ---------------------- Pins ----------------------
-static const uint8_t PWM_PIN = 9;
+// ---------------------------- Pin Mapping -----------------------------------
+static const uint8_t PWM_PIN = 9;   // OC1A
 static const uint8_t FB_PIN  = A0;
 LiquidCrystal lcd(7, 6, 5, 4, 3, 2);
 
-// ---------------------- Sensing + calibration ----------------------
-static const float R_TOP = 100000.0f;
-static const float R_BOT = 4700.0f;
+// ------------------------ Electrical Parameters ------------------------------
+static const float R_TOP = 100000.0f;  // 100k
+static const float R_BOT = 4700.0f;    // 4.7k
 static const float DIV_GAIN = (R_TOP + R_BOT) / R_BOT;
 
-// IMPORTANT FOR ACCURACY:
-// Measure Arduino 5V rail with a multimeter and set ADC_VREF_CAL accordingly.
-// Example: if measured 4.96V, set ADC_VREF_CAL to 4.96f.
-static const float ADC_VREF_CAL = 5.00f;
+static const float ADC_VREF = 5.0f;
+static const float ADC_MAX  = 1023.0f;
 
-// Optional final linear calibration from known points (keep defaults if unknown).
-static const float VOUT_GAIN_CAL = 1.000f;
-static const float VOUT_OFFSET_CAL = 0.00f;
-
-static const float ADC_MAX = 1023.0f;
+static const float VIN_NOMINAL = 9.0f;
 static const float VOUT_TARGET = 100.0f;
-static const float VIN_NOMINAL = 8.0f; // conservative feed-forward for Vin <= 9V operation
 
-// ---------------------- Timer1 PWM ----------------------
-// Fast PWM mode 14 (TOP=ICR1), prescaler=1 => 16MHz / (1+511) = 31.25kHz
+// ------------------------ Timer1 / PWM Parameters ---------------------------
+// Fast PWM mode 14 (WGM13:0 = 1110), TOP = ICR1
+// f_pwm = F_CPU / (N * (1 + TOP)) = 16e6 / (1 * 512) = 31.25kHz
 static const uint16_t PWM_TOP = 511;
-static const float DUTY_MIN = 0.04f;
-static const float DUTY_MAX = 0.95f;
 
-// ---------------------- Control loop ----------------------
-static const uint32_t CONTROL_PERIOD_US = 333; // ~3kHz
+static const float DUTY_MIN = 0.02f;
+static const float DUTY_MAX = 0.96f; // CRITICAL: allow up to ~96% => OCR1A ~490/511
 
-enum ControlMode : uint8_t { STARTUP, REGULATE };
-ControlMode mode = STARTUP;
+// -------------------------- Control Loop ------------------------------------
+static const uint32_t CONTROL_PERIOD_US = 500; // 2kHz
 
-// Startup assist (for low-Vin startup reliability)
-static const float STARTUP_DUTY_BEGIN = 0.84f;
-static const float STARTUP_DUTY_END   = 0.95f;
-static const float STARTUP_RAMP_PER_S = 2.80f;
-static const float STARTUP_EXIT_V = 74.0f;
-static const float STARTUP_REENTER_V = 61.0f;
-static const uint8_t MODE_CONFIRM_COUNT = 6;
-uint8_t readyToRegCount = 0;
-uint8_t backToStartCount = 0;
+// Deadband/hysteresis lock for simulation stability:
+// If |error| < 0.5V -> freeze integrator and hold PWM output (no updates).
+static const float DEADBAND_V = 0.5f;
 
-// PI-D with back-calculation anti-windup (more accurate near limit/saturation)
-static float Kp = 0.034f;
-static float Ki = 0.62f;
-static float Kd = 0.00018f;
-static float Kaw = 1.90f; // stronger anti-windup tracking
+// Aggressive PID for 9V->100V high-gain boost startup/regulation.
+static float Kp = 0.080f;
+static float Ki = 1.40f;
+static float Kd = 0.00020f;
 
 float iTerm = 0.0f;
 float prevErr = 0.0f;
-float dErrFilt = 0.0f;
-float dutyCmd = STARTUP_DUTY_BEGIN;
-float voutFilt = 0.0f;
+float dFilt = 0.0f;
+float dutyCmd = 0.90f;
 
 uint32_t lastControlUs = 0;
 
-// ---------------------- LCD timing ----------------------
-static const uint32_t LCD_VOLT_MS = 120;
-static const uint32_t LCD_DUTY_MS = 100;
-uint32_t lastLcdVoltMs = 0;
-uint32_t lastLcdDutyMs = 0;
+// ---------------------------- LCD / Display ---------------------------------
+static const uint32_t LCD_PERIOD_MS = 250;
+uint32_t lastLcdMs = 0;
 
-// Heavy display averaging (stable readout)
-static const uint8_t AVG_N = 20;
-float vHist[AVG_N] = {0.0f};
-float dHist[AVG_N] = {0.0f};
-uint8_t histIdx = 0;
-uint8_t histCount = 0;
-float vDisplay = 0.0f;
-float dDisplay = STARTUP_DUTY_BEGIN * 100.0f;
+// Simple moving average of 10 readings for displayed voltage.
+static const uint8_t DISP_AVG_N = 10;
+float vDispBuf[DISP_AVG_N] = {0.0f};
+uint8_t vDispIdx = 0;
+uint8_t vDispCount = 0;
 
-// ---------------------- Utilities ----------------------
+// ---------------------------- Utility ---------------------------------------
 static inline float clampf(float x, float lo, float hi) {
   if (x < lo) return lo;
   if (x > hi) return hi;
   return x;
 }
 
-static inline float dutyFromOcr() {
-  return ((float)OCR1A) / PWM_TOP;
+static inline float ocrToDuty(uint16_t ocr) {
+  return ((float)ocr) / PWM_TOP;
 }
 
-static inline void setDuty(float duty) {
+static inline uint16_t dutyToOcr(float duty) {
   duty = clampf(duty, DUTY_MIN, DUTY_MAX);
-  OCR1A = (uint16_t)(duty * PWM_TOP + 0.5f);
-  dutyCmd = dutyFromOcr(); // actual applied duty
+  return (uint16_t)(duty * PWM_TOP + 0.5f);
 }
 
-
-static inline float computeAdaptiveDutyFF(float vout) {
-  // Adaptive feed-forward: derive effective Vin estimate from present operating point
-  // Vin_est ~= Vout*(1-D). Blend with conservative nominal Vin to support Vin<9V cases.
-  float vinEstFromState = clampf(vout * (1.0f - dutyCmd), 3.0f, 15.0f);
-  float vinBlend = 0.65f * VIN_NOMINAL + 0.35f * vinEstFromState;
-  float dutyFF = 1.0f - (vinBlend / VOUT_TARGET);
-  return clampf(dutyFF, 0.70f, DUTY_MAX);
+static inline void applyDuty(float duty) {
+  uint16_t ocr = dutyToOcr(duty);
+  OCR1A = ocr;
+  dutyCmd = ocrToDuty(ocr); // store actual applied duty
 }
 
 float readVoutInstant() {
-  // Precision trimmed-mean ADC sampling:
-  // 8 samples, discard min+max, average remaining 6.
-  uint16_t mn = 1023;
-  uint16_t mx = 0;
-  uint32_t sum = 0;
+  // Light averaging for control path (fast + less switching noise)
+  uint16_t a = analogRead(FB_PIN);
+  uint16_t b = analogRead(FB_PIN);
+  float raw = 0.5f * (a + b);
 
-  for (uint8_t i = 0; i < 8; ++i) {
-    uint16_t r = analogRead(FB_PIN);
-    if (r < mn) mn = r;
-    if (r > mx) mx = r;
-    sum += r;
-  }
-
-  sum -= mn;
-  sum -= mx;
-  float raw = sum / 6.0f;
-
-  float vadc = (raw * ADC_VREF_CAL) / ADC_MAX;
+  float vadc = (raw * ADC_VREF) / ADC_MAX;
   float vout = vadc * DIV_GAIN;
-
-  // Apply linear calibration (for divider tolerance + ADC gain error)
-  vout = vout * VOUT_GAIN_CAL + VOUT_OFFSET_CAL;
-
   return clampf(vout, 0.0f, 140.0f);
+}
+
+void pushDisplayVoltage(float v) {
+  vDispBuf[vDispIdx] = v;
+  vDispIdx = (vDispIdx + 1) % DISP_AVG_N;
+  if (vDispCount < DISP_AVG_N) vDispCount++;
+}
+
+float getDisplayVoltageAvg() {
+  float sum = 0.0f;
+  for (uint8_t i = 0; i < vDispCount; i++) sum += vDispBuf[i];
+  return (vDispCount > 0) ? (sum / vDispCount) : 0.0f;
 }
 
 void setupTimer1_31kHz() {
@@ -141,9 +111,9 @@ void setupTimer1_31kHz() {
 
   TCCR1A = 0;
   TCCR1B = 0;
-  TCNT1 = 0;
+  TCNT1  = 0;
 
-  // Mode 14: WGM13:0 = 1110
+  // Fast PWM mode 14: WGM13:0 = 1110
   TCCR1A |= (1 << WGM11);
   TCCR1B |= (1 << WGM13) | (1 << WGM12);
 
@@ -153,154 +123,102 @@ void setupTimer1_31kHz() {
   // Prescaler = 1
   TCCR1B |= (1 << CS10);
 
+  // TOP for 31.25kHz
   ICR1 = PWM_TOP;
-  OCR1A = (uint16_t)(STARTUP_DUTY_BEGIN * PWM_TOP);
+
+  // Start near required high-gain duty
+  OCR1A = dutyToOcr(0.90f);
+  dutyCmd = ocrToDuty(OCR1A);
 }
 
 void setup() {
   analogReference(DEFAULT);
   pinMode(FB_PIN, INPUT);
+
   setupTimer1_31kHz();
 
   lcd.begin(16, 2);
   lcd.clear();
   lcd.setCursor(0, 0);
-  lcd.print("Boost PID Init");
+  lcd.print("Boost Ctrl Init");
 
   float v0 = readVoutInstant();
-  voutFilt = v0;
-  vDisplay = v0;
-
-  for (uint8_t i = 0; i < AVG_N; i++) {
-    vHist[i] = v0;
-    dHist[i] = dutyFromOcr() * 100.0f;
-  }
-  histCount = AVG_N;
+  for (uint8_t i = 0; i < DISP_AVG_N; i++) vDispBuf[i] = v0;
+  vDispCount = DISP_AVG_N;
 
   lastControlUs = micros();
-  lastLcdVoltMs = millis();
-  lastLcdDutyMs = millis();
+  lastLcdMs = millis();
 }
 
 void controlStep(float dt) {
   float vout = readVoutInstant();
+  pushDisplayVoltage(vout);
 
-  // Two-stage filter: first is implicit in trimmed mean, second is IIR.
-  voutFilt += 0.20f * (vout - voutFilt);
+  // Feed-forward from boost relation for 9V nominal:
+  // D = 1 - Vin/Vout => ~0.91 for 9V->100V
+  float dutyFF = 1.0f - (VIN_NOMINAL / VOUT_TARGET);
 
-  if (mode == STARTUP) {
-    dutyCmd += STARTUP_RAMP_PER_S * dt;
-    if (dutyCmd > STARTUP_DUTY_END) dutyCmd = STARTUP_DUTY_END;
-    setDuty(dutyCmd);
+  float err = VOUT_TARGET - vout;
 
-    if (voutFilt >= STARTUP_EXIT_V) {
-      if (++readyToRegCount >= MODE_CONFIRM_COUNT) {
-        mode = REGULATE;
-
-        float dutyFF = computeAdaptiveDutyFF(voutFilt);
-        float err = VOUT_TARGET - voutFilt;
-
-        iTerm = clampf(dutyCmd - dutyFF - Kp * err, -0.20f, 0.20f);
-        prevErr = err;
-        dErrFilt = 0.0f;
-        readyToRegCount = 0;
-      }
-    } else {
-      readyToRegCount = 0;
-    }
-  } else {
-    float err = VOUT_TARGET - voutFilt;
-    float dErr = (err - prevErr) / dt;
-    prevErr = err;
-
-    dErrFilt += 0.10f * (dErr - dErrFilt);
-
-    float dutyFF = computeAdaptiveDutyFF(voutFilt);
-    float pTerm = Kp * err;
-    float dTerm = Kd * dErrFilt;
-
-    float uUnsat = dutyFF + pTerm + iTerm + dTerm;
-    float uSat = clampf(uUnsat, DUTY_MIN, DUTY_MAX);
-
-    // Back-calculation anti-windup:
-    // iDot = Ki*e + Kaw*(uSat - uUnsat)
-    float iDot = Ki * err + Kaw * (uSat - uUnsat);
-
-    // Scale integrator with error magnitude to keep fast correction at low Vin
-    // while preserving precision near setpoint.
-    float iScale = (err > 20.0f) ? 0.65f : ((err > 8.0f) ? 0.85f : 1.0f);
-    iTerm += (iDot * iScale) * dt;
-    iTerm = clampf(iTerm, -0.30f, 0.30f);
-
-    float u = clampf(dutyFF + pTerm + iTerm + dTerm, DUTY_MIN, DUTY_MAX);
-
-    // Low-Vin assist: dynamic minimum duty so Vin<9V can still converge to 100V.
-    if (voutFilt < 92.0f) {
-      float assist = (voutFilt < 70.0f) ? 0.95f : ((voutFilt < 82.0f) ? 0.94f : 0.92f);
-      if (u < assist) u = assist;
-    }
-
-    // Overshoot guard with soft recovery (accuracy near 100V)
-    if (voutFilt > 103.5f) {
-      u = 0.14f;
-      iTerm = clampf(iTerm, -0.08f, 0.08f);
-    }
-
-    setDuty(u);
-
-    if (voutFilt < STARTUP_REENTER_V) {
-      if (++backToStartCount >= MODE_CONFIRM_COUNT) {
-        mode = STARTUP;
-        backToStartCount = 0;
-      }
-    } else {
-      backToStartCount = 0;
-    }
+  // ---------------- DEAD BAND LOCK ----------------
+  // If we are within +/-0.5V around target, freeze controller output.
+  // This avoids tiny high-frequency duty dithers that can trigger
+  // Proteus "timestep too small" at high voltage.
+  if (fabs(err) < DEADBAND_V) {
+    return; // hold current PWM and integral (no update)
   }
 
-  vHist[histIdx] = vout;
-  dHist[histIdx] = dutyCmd * 100.0f;
-  histIdx = (histIdx + 1) % AVG_N;
-  if (histCount < AVG_N) histCount++;
-}
+  float derr = (err - prevErr) / dt;
+  prevErr = err;
 
-void computeDisplayAverages(float &vAvg, float &dAvg) {
-  float vSum = 0.0f;
-  float dSum = 0.0f;
+  // derivative low-pass (simple, robust)
+  dFilt += 0.15f * (derr - dFilt);
 
-  for (uint8_t i = 0; i < histCount; i++) {
-    vSum += vHist[i];
-    dSum += dHist[i];
+  // Immediate integral reset on overshoot request from user:
+  // if Vout > target, clear integral to stop sticking near high duty.
+  if (vout > VOUT_TARGET) {
+    iTerm = 0.0f;
   }
 
-  vAvg = vSum / histCount;
-  dAvg = dSum / histCount;
+  float pTerm = Kp * err;
+  float dTerm = Kd * dFilt;
+
+  // tentative integration
+  float iCand = iTerm + Ki * err * dt;
+
+  // anti-windup: block integration if saturated in same direction
+  float uUnsatCand = dutyFF + pTerm + dTerm + iCand;
+  bool satHigh = (uUnsatCand > DUTY_MAX);
+  bool satLow  = (uUnsatCand < DUTY_MIN);
+  bool blockI  = (satHigh && err > 0.0f) || (satLow && err < 0.0f);
+
+  if (!blockI) {
+    iTerm = iCand;
+  }
+
+  iTerm = clampf(iTerm, -0.30f, 0.35f);
+
+  float u = dutyFF + pTerm + dTerm + iTerm;
+
+  // Assist to guarantee low-Vin climb without restricting top duty.
+  if (vout < 85.0f && u < 0.93f) u = 0.93f;
+
+  u = clampf(u, DUTY_MIN, DUTY_MAX);
+  applyDuty(u);
 }
 
-void updateLcdVoltageLine() {
-  float vAvg, dAvg;
-  computeDisplayAverages(vAvg, dAvg);
-
-  vDisplay += 0.22f * (vAvg - vDisplay);
+void updateLcd() {
+  float vAvg = getDisplayVoltageAvg();
 
   lcd.setCursor(0, 0);
   lcd.print("Vout:");
-  lcd.print(vDisplay, 2);
-  lcd.print("V  ");
-}
-
-void updateLcdDutyLine() {
-  float vAvg, dAvg;
-  computeDisplayAverages(vAvg, dAvg);
-
-  dDisplay = dAvg;
+  lcd.print(vAvg, 1);
+  lcd.print("V   ");
 
   lcd.setCursor(0, 1);
   lcd.print("D:");
-  lcd.print(dDisplay, 1);
-  lcd.print("% ");
-  lcd.print(mode == STARTUP ? "ST" : "RG");
-  lcd.print(" ");
+  lcd.print(dutyCmd * 100.0f, 1);
+  lcd.print("%    ");
 }
 
 void loop() {
@@ -316,14 +234,8 @@ void loop() {
   }
 
   uint32_t nowMs = millis();
-
-  if ((uint32_t)(nowMs - lastLcdVoltMs) >= LCD_VOLT_MS) {
-    lastLcdVoltMs = nowMs;
-    updateLcdVoltageLine();
-  }
-
-  if ((uint32_t)(nowMs - lastLcdDutyMs) >= LCD_DUTY_MS) {
-    lastLcdDutyMs = nowMs;
-    updateLcdDutyLine();
+  if ((uint32_t)(nowMs - lastLcdMs) >= LCD_PERIOD_MS) {
+    lastLcdMs = nowMs;
+    updateLcd();
   }
 }
